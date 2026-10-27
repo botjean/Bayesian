@@ -19,7 +19,7 @@ import emcee
 import numpy as np
 import numpy.typing as npt
 
-from bayesian import data_IO, emulation, log_posterior
+from bayesian import data_IO, emulation, log_posterior, parameter_prior
 from bayesian.mc_sampling import base as mc_sampling_base
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,45 @@ def _apply_random_seed(sampler: emcee.EnsembleSampler, seed: int | None) -> None
 
     rng = np.random.RandomState(seed)
     sampler.random_state = rng.get_state()
+
+
+def _draw_initial_positions(
+    rng: np.random.Generator,
+    parameter_min: npt.NDArray[np.float64],
+    parameter_max: npt.NDArray[np.float64],
+    n_walkers: int,
+    parameterization_config: dict[str, Any],
+) -> npt.NDArray[np.float64]:
+    """Draw initial walkers within the configured prior support."""
+    accepted: list[npt.NDArray[np.float64]] = []
+    n_accepted = 0
+    n_proposed = 0
+    max_proposals = max(100_000, 1000 * n_walkers)
+    while n_accepted < n_walkers and n_proposed < max_proposals:
+        batch_size = max(32, 2 * (n_walkers - n_accepted))
+        candidates = rng.uniform(
+            parameter_min,
+            parameter_max,
+            (batch_size, len(parameter_min)),
+        )
+        selected = candidates[
+            np.isfinite(
+                parameter_prior.log_prior(
+                    candidates,
+                    parameterization_config,
+                )
+            )
+        ]
+        if selected.size:
+            accepted.append(selected)
+            n_accepted += len(selected)
+        n_proposed += batch_size
+    if n_accepted < n_walkers:
+        raise RuntimeError(
+            "Could not initialize enough walkers inside configured prior "
+            f"support after {n_proposed} proposals"
+        )
+    return np.concatenate(accepted, axis=0)[:n_walkers]
 
 
 @attrs.define
@@ -157,7 +196,18 @@ def run_sampling(
         _apply_random_seed(sampler, sampler_settings.random_seed)
 
         rng = np.random.default_rng(sampler_settings.random_seed)
-        random_pos = rng.uniform(parameter_min, parameter_max, (sampler_settings.n_walkers, parameter_ndim))
+        parameterization_config = (
+            emulation_config.analysis_settings.raw_analysis_config[
+                "parameterization"
+            ][emulation_config.analysis_settings.parameterization]
+        )
+        random_pos = _draw_initial_positions(
+            rng,
+            parameter_min,
+            parameter_max,
+            sampler_settings.n_walkers,
+            parameterization_config,
+        )
 
         # First half of burn-in from random positions
         logger.info(f"Parallelizing over {pool._processes} processes...")  # type: ignore[attr-defined]

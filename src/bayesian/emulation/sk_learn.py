@@ -29,6 +29,7 @@ import yaml
 
 from bayesian import analysis, data_IO
 from bayesian.emulation import base as emulation_base
+from bayesian.emulation import simulation_noise
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,8 @@ def _validate_signal_amplitude_cache(results: dict[str, Any], emulator_settings:
 
 
 def fit_emulator(
-    emulator_settings: SKLearnEmulatorSettings, analysis_settings: analysis.AnalysisSettings
+    emulator_settings: SKLearnEmulatorSettings, analysis_settings: analysis.AnalysisSettings,
+    *, prepare_only: bool = False,
 ) -> dict[str, Any]:
     """Do PCA and fit the emulator.
 
@@ -111,13 +113,14 @@ def fit_emulator(
     )
 
     # Check if emulator already exists
-    if output_filename.exists():
+    if output_filename.exists() and not prepare_only:
         if emulator_settings.force_retrain:
             output_filename.unlink()
             logger.info(f"Removed {output_filename}")
         else:
             cached = emulation_base.IO.read_emulator(emulator_settings, analysis_settings)
             _validate_signal_amplitude_cache(cached, emulator_settings)
+            simulation_noise.validate_cache(cached, emulator_settings, check_file=True)
             logger.info(f"Emulators already exist: {output_filename} (to force retrain, set force_retrain: True)")
             return {}
 
@@ -265,16 +268,32 @@ def fit_emulator(
     # log-marginal-likelihood surface has several optima within a few units) land on a different
     # optimum from fit to fit, which alone shifts the posterior (seen 2026-09-16: alpha_s by 0.03).
     random_state = emulator_settings.settings.get("random_state", None)
-    emulators = [
-        sklearn_gaussian_process.GaussianProcessRegressor(
-            kernel=_kernel_for_pc(kernel, y, emulator_settings),
-            alpha=emulator_settings.alpha,
-            n_restarts_optimizer=emulator_settings.n_restarts,
-            copy_X_train=False,
+    noise_config = simulation_noise.configuration(emulator_settings)
+    joint_pc_gp = None
+    if noise_config is not None and noise_config.get('joint_groups') and not prepare_only:
+        raise ValueError('joint_groups must be fitted through emulation.fit_emulators')
+    if prepare_only:
+        emulators = []
+    elif noise_config is not None:
+        covariance = simulation_noise.load_covariance(emulator_settings, analysis_settings)
+        projected = simulation_noise.project_covariance(covariance, pca, scaler, emulator_settings.n_pc)
+        joint_pc_gp = simulation_noise.JointPCGP(
+            [_kernel_for_pc(kernel, y, emulator_settings) for y in Y_pca_truncated.T],
+            jitter=emulator_settings.alpha, n_restarts=emulator_settings.n_restarts,
             random_state=random_state,
-        ).fit(design, y)
-        for y in Y_pca_truncated.T
-    ]
+        ).fit(design, Y_pca_truncated, projected)
+        emulators = [simulation_noise.PCView(joint_pc_gp, i) for i in range(emulator_settings.n_pc)]
+    else:
+        emulators = [
+            sklearn_gaussian_process.GaussianProcessRegressor(
+                kernel=_kernel_for_pc(kernel, y, emulator_settings),
+                alpha=emulator_settings.alpha,
+                n_restarts_optimizer=emulator_settings.n_restarts,
+                copy_X_train=False,
+                random_state=random_state,
+            ).fit(design, y)
+            for y in Y_pca_truncated.T
+        ]
     for i_pc, gp in enumerate(emulators):
         logger.info(f"  PC{i_pc}: log-marginal-likelihood {gp.log_marginal_likelihood_value_:.3f}  kernel_ {gp.kernel_}")
 
@@ -296,9 +315,15 @@ def fit_emulator(
     output_dict["PCA"]["transfer"] = pca_transfer
     output_dict["PCA"]["scaler"] = scaler
     output_dict["emulators"] = emulators
+    if joint_pc_gp is not None:
+        output_dict['joint_pc_gp'] = joint_pc_gp
+        output_dict['simulation_noise'] = simulation_noise.fingerprint(noise_config)
     signal_amplitude = _signal_amplitude_settings(emulator_settings)
     if signal_amplitude is not None:
         output_dict["signal_amplitude"] = signal_amplitude
+    if prepare_only:
+        output_dict['_training_design'] = design
+        output_dict['_initial_kernels'] = [_kernel_for_pc(kernel, y, emulator_settings) for y in Y_pca_truncated.T]
 
     return output_dict
 
@@ -339,6 +364,7 @@ def predict(
     """
 
     _validate_signal_amplitude_cache(results, emulator_settings)
+    simulation_noise.validate_cache(results, emulator_settings)
 
     # The emulators are stored as a list (one for each PC)
     emulators = results["emulators"]
@@ -357,6 +383,10 @@ def predict(
     n_samples = parameters.shape[0]
     emulator_central_value = np.zeros((n_samples, emulator_settings.n_pc))
     emulator_cov = np.zeros((n_samples, emulator_settings.n_pc, emulator_settings.n_pc))
+
+    if results.get('joint_pc_gp') is not None:
+        emulator_central_value, emulator_cov = results['joint_pc_gp'].predict(parameters)
+        emulators = []  # Full PC cross-covariance is already included above.
 
     for i, emulator in enumerate(emulators):
         try:
@@ -521,6 +551,7 @@ class SKLearnEmulatorSettings:
             "Must provide exactly one of 'matern', 'rbf' kernel"
         )
         _signal_amplitude_settings(self)
+        simulation_noise.configuration(self)
 
         # Validation for noise configuration
         if "noise" in self.active_kernels:

@@ -206,8 +206,12 @@ class SystematicInfo:
             )
             raise ValueError(msg)
 
-        # Clip correlation strength to [0, 1].
-        if self.cor_strength < 0.0 or self.cor_strength > 1.0:
+        if self.cor_kind == "shift_shape":
+            from bayesian.systematic_shift_shape import shift_shape_correlation
+
+            shift_shape_correlation(1, self.cor_strength, self.cor_length)
+        # Preserve legacy clipping, but never clip the signed opt-in parameter.
+        elif self.cor_strength < 0.0 or self.cor_strength > 1.0:
             logger.warning(
                 f"Correlation strength {self.cor_strength} for {self.full_name} outside [0,1]. Clipping to valid range."
             )
@@ -377,7 +381,7 @@ def parse_systematic_config(sys_config_string: str) -> dict:
 def _parse_group_correlation_param(param_string: str, group_tag: str = "default") -> dict:
     """Parse one `correlation_groups` value into kernel parameters.
 
-    Two accepted forms:
+    Three accepted forms:
       1. '<cor_length>:<cor_strength>'  -- bin-index kernel, rho = S * exp(-|i-j| / L);
          L = -1 means FULL correlation across every bin carrying the tag. e.g. '-1:1', '3:0.8'.
       2. 'ptgauss:<L>[:<strength>]'     -- pT-Gaussian kernel (paper Eq. 10),
@@ -385,10 +389,46 @@ def _parse_group_correlation_param(param_string: str, group_tag: str = "default"
          e.g. 'ptgauss:0.1'. Only well-defined WITHIN a single observable: a tag spanning
          several observables falls back to full correlation (the covariance builder warns),
          since p~ is rescaled per observable and a shared length is meaningless across them.
+      3. 'shiftshape:<t>:<original_bins>' -- opt-in standardized shift/contrast
+         diagnostic, t in [-1,1]. Each tag must belong to one observable. The
+         original bin count is explicit so selection cuts do not change rho.
+      4. 'jetscape:<L>' -- exact published Gaussian exp(-(|delta x|/L)^2).
+         Registered normalized coordinates and single-observable scope are required.
+         L=0 is the zero-length limit; L=inf is full within-observable correlation.
+         Existing ptgauss configurations retain their exponent of 1.9.
 
     Returns {'cor_kind', 'cor_length', 'cor_length_pt', 'cor_strength'}.
     """
     parts = str(param_string).split(":")
+
+    if parts[0].strip().lower() == "jetscape":
+        if len(parts) != 2:
+            raise ValueError(f"Group '{group_tag}': expected 'jetscape:<length>'")
+        try:
+            length = float(parts[1])
+        except ValueError as e:
+            raise ValueError(f"Group '{group_tag}': invalid JETSCAPE length") from e
+        if np.isnan(length) or length < 0:
+            raise ValueError(f"Group '{group_tag}': JETSCAPE length must be nonnegative")
+        return dict(cor_kind="gaussian_jetscape", cor_length=-1,
+                    cor_length_pt=length, cor_strength=1.0)
+
+    if parts[0].strip().lower() == "shiftshape":
+        if len(parts) != 3:
+            raise ValueError(f"Group '{group_tag}': expected 'shiftshape:<t>:<original_bins>'")
+        try:
+            parameter, original_bins = float(parts[1]), int(parts[2])
+        except ValueError as e:
+            raise ValueError(f"Group '{group_tag}': invalid shiftshape parameters") from e
+        from bayesian.systematic_shift_shape import shift_shape_correlation
+
+        shift_shape_correlation(1, parameter, original_bins)
+        return {
+            "cor_kind": "shift_shape",
+            "cor_length": original_bins,
+            "cor_length_pt": None,
+            "cor_strength": parameter,
+        }
 
     if parts[0].strip().lower() == "ptgauss":
         if len(parts) not in (2, 3):
@@ -770,7 +810,7 @@ class SystematicCorrelationManager:
                         sys_info.cor_kind = cor_kind
                         sys_info.cor_length = cor_length
                         sys_info.cor_strength = cor_strength
-                        if cor_kind == "gaussian_pt":
+                        if cor_kind in ("gaussian_pt", "gaussian_jetscape"):
                             sys_info.cor_length_pt = cor_length_pt
                         n_updated += 1
 
@@ -931,6 +971,23 @@ class SystematicCorrelationManager:
             return np.eye(n_bins)
 
         cor_strength = sys_info.cor_strength
+
+        if sys_info.cor_kind == "gaussian_jetscape":
+            ell = sys_info.cor_length_pt
+            if pt is None or len(pt) != n_bins:
+                raise ValueError(f"JETSCAPE group '{systematic_full_name}' requires registered coordinates")
+            p = np.asarray(pt, dtype=float)
+            if p.ndim != 1 or not np.isfinite(p).all() or np.isnan(ell) or ell < 0:
+                raise ValueError(f"JETSCAPE group '{systematic_full_name}': invalid coordinates or length")
+            distance = np.abs(p[:, None] - p[None, :])
+            if ell == 0:
+                return (distance == 0).astype(float)
+            return np.exp(-np.square(distance / ell))
+
+        if sys_info.cor_kind == "shift_shape":
+            from bayesian.systematic_shift_shape import shift_shape_correlation
+
+            return shift_shape_correlation(n_bins, cor_strength, sys_info.cor_length)
 
         # pT-Gaussian kernel (paper Eq. 10, STAT reader.py:333): C[i,j] = strength *
         # exp(-(|p_i - p_j|/ell)^1.9), with p rescaled to [0,1] per observable. STAT uses the
@@ -1093,13 +1150,24 @@ class SystematicCorrelationManager:
                 f"mode={'gaussian_pt' if group_cor_kind == 'gaussian_pt' else ('full' if cor_length == -1 else 'exponential')}"
             )
 
-            if group_cor_kind == "gaussian_pt":
+            if group_cor_kind == "shift_shape":
+                if len(group_obs_labels) != 1:
+                    raise ValueError(
+                        f"shiftshape group '{group_tag}' spans multiple observables; "
+                        "use separate explicit tags rather than invent cross-observable correlations"
+                    )
+                from bayesian.systematic_shift_shape import shift_shape_correlation
+
+                block = shift_shape_correlation(len(idx), cor_strength, cor_length) * np.outer(u, u)
+            elif group_cor_kind in ("gaussian_pt", "gaussian_jetscape"):
                 # Per-source pT-Gaussian block (paper Eq. 10). Auto-tagged per-source groups are
                 # single-observable, so map the group's global bins to the observable's local pT
                 # indices and correlate this ONE source's outer product. Summing across the
                 # observable's source groups (each added below) gives per-source-then-sum,
                 # block-diagonal per observable, matching STAT.
                 pt_local = None
+                if group_cor_kind == "gaussian_jetscape" and len(group_obs_labels) != 1:
+                    raise ValueError(f"JETSCAPE group '{group_tag}' must belong to one observable")
                 if len(group_obs_labels) == 1:
                     obs_label = next(iter(group_obs_labels))
                     pt_full = self._observable_pt.get(obs_label)

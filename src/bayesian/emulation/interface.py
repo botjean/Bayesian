@@ -134,6 +134,10 @@ def fit_emulators(emulation_config: EmulationConfig, analysis_settings: analysis
     Returns:
         None.
     """
+    from bayesian.emulation import joint_groups
+    if joint_groups.enabled(emulation_config):
+        joint_groups.fit(emulation_config, analysis_settings)
+        return
     # Fit the emulator for each emulation group
     emulators_output = {}
 
@@ -200,6 +204,11 @@ def predict(
             automatically compute it here. If None, will be calculated. Default: None.
         emulator_predictions: Dictionary containing matrices of central values and covariance
     """
+    from bayesian.emulation import joint_groups
+    if joint_groups.enabled(emulation_config):
+        return joint_groups.predict(parameters, emulation_config, analysis_settings,
+                                    emulator_results, emulator_additional_covariance,
+                                    merge_predictions_over_groups)
     if emulator_results is None:
         emulator_results = {}
     if emulator_additional_covariance is None:

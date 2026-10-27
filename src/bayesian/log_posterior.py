@@ -24,7 +24,7 @@ import numpy as np
 import numpy.typing as npt
 from scipy.linalg import lapack
 
-from bayesian import emulation
+from bayesian import emulation, parameter_prior
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ g_experimental_results: dict = None
 g_emulator_cov_unexplained: dict = None
 g_systematic_covariance: npt.NDArray[np.float64] = None
 g_C_stat: npt.NDArray[np.float64] = None
+g_parameterization_config: dict = None
 
 
 def _build_systematic_covariance(experimental_results: dict) -> npt.NDArray[np.float64]:
@@ -130,6 +131,7 @@ def initialize_pool_variables(
 
     global g_min, g_max, g_emulation_config, g_emulation_results, g_experimental_results
     global g_emulator_cov_unexplained, g_systematic_covariance, g_C_stat, g_log_prior_indices
+    global g_parameterization_config
     g_min = local_min
     g_max = local_max
     g_log_prior_indices = tuple(local_log_prior_indices or ())
@@ -137,6 +139,10 @@ def initialize_pool_variables(
     g_emulation_results = local_emulation_results
     g_experimental_results = local_experimental_results
     g_emulator_cov_unexplained = local_emulator_cov_unexplained
+    parameterization = g_emulation_config.analysis_settings.parameterization
+    g_parameterization_config = g_emulation_config.analysis_settings.raw_analysis_config[
+        "parameterization"
+    ][parameterization]
 
     if "external_covariance" in g_experimental_results:
         logger.info("External covariance mode: skipping systematic covariance construction")
@@ -207,6 +213,9 @@ def log_posterior(X, *, set_to_infinite_outside_bounds: bool = True) -> npt.NDAr
     n_features = g_experimental_results["y"].shape[0]
 
     if n_samples > 0:
+        log_posterior[inside] += parameter_prior.log_prior(
+            X[inside], g_parameterization_config
+        )
         # Get experimental data
         data_y = g_experimental_results["y"]
 
