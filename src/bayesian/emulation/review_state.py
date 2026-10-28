@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from sklearn.gaussian_process.kernels import ConstantKernel, Matern, Product, RBF
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, Product, RBF, Sum
 
 from bayesian.emulation.mean_aware import FastMeanAware
 
@@ -22,15 +22,16 @@ SCHEMA = 'bayesian-mean-aware-prediction-v1'
 
 
 def kernel_record(kernel):
-    if type(kernel) is Product:
-        return dict(kind='product', left=kernel_record(kernel.k1), right=kernel_record(kernel.k2))
+    if type(kernel) in (Product, Sum):
+        return dict(kind='product' if type(kernel) is Product else 'sum',
+                    left=kernel_record(kernel.k1), right=kernel_record(kernel.k2))
     if type(kernel) is ConstantKernel:
         return dict(kind='constant', value=float(kernel.constant_value))
     if type(kernel) in (Matern, RBF):
         value = dict(kind='matern' if type(kernel) is Matern else 'rbf',
                      length_scale=np.asarray(kernel.length_scale).tolist())
         if type(kernel) is Matern:
-            value['nu'] = float(kernel.nu)
+            value['nu'] = 'inf' if kernel.nu == np.inf else float(kernel.nu)
         return value
     raise ValueError('Unsupported prediction-state kernel: ' + type(kernel).__name__)
 
@@ -39,8 +40,9 @@ def restore_kernel(record, depth=0):
     if depth > 8 or not isinstance(record, dict):
         raise ValueError('Invalid prediction-state kernel')
     kind = record.get('kind')
-    if kind == 'product' and set(record) == {'kind', 'left', 'right'}:
-        return restore_kernel(record['left'], depth+1) * restore_kernel(record['right'], depth+1)
+    if kind in ('product', 'sum') and set(record) == {'kind', 'left', 'right'}:
+        left, right = restore_kernel(record['left'], depth+1), restore_kernel(record['right'], depth+1)
+        return left * right if kind == 'product' else left + right
     if kind == 'constant' and set(record) == {'kind', 'value'}:
         value = float(record['value'])
         if not np.isfinite(value) or value <= 0:
@@ -54,8 +56,8 @@ def restore_kernel(record, depth=0):
         if kind == 'rbf':
             return RBF(length, length_scale_bounds='fixed')
         nu = float(record['nu'])
-        if nu not in (.5, 1.5, 2.5):
-            raise ValueError('Unsupported Matern smoothness')
+        if np.isnan(nu) or nu <= 0:
+            raise ValueError('Invalid Matern smoothness')
         return Matern(length, length_scale_bounds='fixed', nu=nu)
     raise ValueError('Unknown or malformed kernel record')
 

@@ -2,10 +2,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from sklearn.gaussian_process.kernels import ConstantKernel, Matern
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF
 
 from bayesian.emulation.mean_aware import FastMeanAware
-from bayesian.emulation.review_state import load_prediction_state, restore_kernel, save_prediction_state
+from bayesian.emulation.review_state import kernel_record, load_prediction_state, restore_kernel, save_prediction_state
 
 
 def fixture():
@@ -54,6 +54,17 @@ def test_invalid_checkpoint_fields_rejected(tmp_path):
     np.savez(path, metadata=np.array('{}'))
     with pytest.raises(ValueError, match='fields'):
         load_prediction_state(path)
+
+
+@pytest.mark.parametrize('kernel', [ConstantKernel(.3) + Matern(.2, nu=1.5),
+    Matern(.4, nu=.7), Matern(.4, nu=np.inf), RBF(.3)])
+def test_native_kernel_records_roundtrip(kernel):
+    record = kernel_record(kernel)
+    # Even infinite Matern smoothness has a strict JSON representation.
+    import json
+    restored = restore_kernel(json.loads(json.dumps(record, allow_nan=False)))
+    points = np.array([[.1], [.5], [.9]])
+    np.testing.assert_array_equal(restored(points), kernel(points))
 
 
 @pytest.mark.parametrize('record', [dict(kind='exec', code='bad'),

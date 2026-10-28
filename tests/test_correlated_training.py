@@ -165,6 +165,40 @@ def test_train_fresh_roundtrip_and_paired_holdout(inputs, tmp_path, monkeypatch,
     assert report['holdout_qa']['paired_mc_available']
 
 
+def test_mean_aware_caches_cannot_silently_use_retained_only_prediction(inputs, tmp_path):
+    from bayesian.emulation import interface, sk_learn
+
+    bank = call(pt.train, inputs, tmp_path / 'trained', optimize=False)
+    points = np.array([[.22], [.8]])
+    restored, _, _, _ = load_prediction_state(tmp_path / 'trained/prediction_state.npz')
+    expected = bank['model'].predict(points)
+    for key, value in restored.predict(points).items():
+        np.testing.assert_allclose(value, expected[key], atol=1e-13, rtol=1e-11)
+    with pytest.raises(ValueError, match='complete observable-space predictor'):
+        interface.predict(points, bank['ec'], analysis_settings=bank['settings'],
+                          emulator_results=bank['models'])
+    # Loading the caches from disk must fail equally clearly.
+    with pytest.raises(ValueError, match='complete observable-space predictor'):
+        interface.predict(points, bank['ec'], analysis_settings=bank['settings'])
+    for group, settings in bank['ec'].emulation_settings.items():
+        with pytest.raises(ValueError, match='complete observable-space predictor'):
+            sk_learn.predict(points, bank['models'][group], settings)
+
+
+def test_native_additive_constant_kernel_survives_training_export(inputs, tmp_path):
+    groups = inputs['config']['analyses']['analysis_test']['parameters']['emulators']
+    for group in groups.values():
+        group['kernels']['active'].append('constant')
+        group['kernels']['constant'] = dict(constant_value=.2, constant_value_bounds=[.01, 2.])
+    bank = call(pt.train, inputs, tmp_path / 'trained', optimize=False)
+    model, _, _, _ = load_prediction_state(tmp_path / 'trained/prediction_state.npz')
+    points = np.array([[.22], [.8]])
+    expected = bank['model'].predict(points)
+    for key, value in model.predict(points).items():
+        np.testing.assert_allclose(value, expected[key], atol=1e-13, rtol=1e-11)
+    assert (tmp_path / 'trained/training_report.json').is_file()
+
+
 def test_default_optimizes_with_explicit_native_restarts(inputs, tmp_path, monkeypatch, capsys):
     actual_fit = RestrictedMeanGP.fit
     seen = []

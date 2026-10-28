@@ -48,6 +48,13 @@ designs are present in the supplied covariance archive.
 NPZ/JSON without loading executable pickle objects. It is a prediction-state
 format, not a replacement for raw training tables or measured covariance.
 
+For REML banks, use ``bank['model']`` or reload ``prediction_state.npz`` with
+``review_state.load_prediction_state``. Native group cache files retain PC-level
+diagnostics, not the complete retained/omitted observable-space conditioning.
+Passing those caches to ``interface.predict`` or ``sk_learn.predict`` is rejected
+rather than silently substituting a different covariance. The ordinary native
+joint-GP path is unchanged.
+
 Inference
 ---------
 

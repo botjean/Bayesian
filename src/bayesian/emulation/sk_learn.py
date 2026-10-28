@@ -365,6 +365,9 @@ def predict(
 
     _validate_signal_amplitude_cache(results, emulator_settings)
     simulation_noise.validate_cache(results, emulator_settings)
+    if results.get('mean_aware_training'):
+        raise ValueError('Mean-aware training requires the complete observable-space predictor; '
+                         "use bank['model'] or review_state.load_prediction_state, not native group caches")
 
     # The emulators are stored as a list (one for each PC)
     emulators = results["emulators"]

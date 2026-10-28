@@ -154,6 +154,9 @@ def predict(points, config, analysis_settings, results=None, additional=None, me
         if name not in results:
             results[name] = base.IO.read_emulator(settings, analysis_settings)
     validate_results(config, results)
+    if any(result.get('mean_aware_training') for result in results.values()):
+        raise ValueError('Mean-aware training requires the complete observable-space predictor; '
+                         "use bank['model'] or review_state.load_prediction_state, not native group caches")
     joint = next(iter(results.values()))['joint_pc_gp'].joint
     mean_pc, cov_pc = joint.predict(points)
     _, transfer, center, residual, group_indices = linear_maps(config, results, additional)
